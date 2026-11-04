@@ -81,8 +81,31 @@ def find_fusion_groups(graph: fx.Graph) -> list[list[fx.Node]]:
 
     order = {n: i for i, n in enumerate(graph.nodes)}
     groups = {id(g): g for g in group_of.values()}.values()
-    # Fusing a single op gains nothing; leave those to ATen.
-    return [sorted(g, key=order.__getitem__) for g in groups if len(g) > 1]
+    return [sorted(g, key=order.__getitem__) for g in groups]
+
+
+def external_inputs(group: list[fx.Node]) -> list[fx.Node]:
+    """Nodes the group reads from outside, deduplicated, in first-use order."""
+    members = set(group)
+    return list(dict.fromkeys(
+        arg for node in group for arg in node.all_input_nodes if arg not in members
+    ))
+
+
+def emit_pointwise_ops(group, names, lines) -> str:
+    """Append one Triton line per node in `group` and return the variable
+    holding the group's result. `names` maps each external input node to the
+    Triton variable it was loaded into."""
+    def operand(arg):
+        if isinstance(arg, fx.Node):
+            return names[arg]
+        return repr(float(arg))  # Python scalar baked in as a constant
+
+    for j, node in enumerate(group):
+        expr = POINTWISE_OPS[node.target](*map(operand, node.args))
+        lines.append(f"    t{j} = {expr}  # {node.target}")
+        names[node] = f"t{j}"
+    return names[group[-1]]
 
 
 def generate_kernel_source(name, group, inputs, rank):
@@ -120,21 +143,18 @@ def generate_kernel_source(name, group, inputs, rank):
         lines.append(f"    x{i} = tl.load(in{i}_ptr + {offset}, mask=mask).to(tl.float32)")
         names[inp] = f"x{i}"
 
-    def operand(arg):
-        if isinstance(arg, fx.Node):
-            return names[arg]
-        return repr(float(arg))  # Python scalar baked in as a constant
-
-    for j, node in enumerate(group):
-        expr = POINTWISE_OPS[node.target](*map(operand, node.args))
-        lines.append(f"    t{j} = {expr}  # {node.target}")
-        names[node] = f"t{j}"
-
-    lines.append(f"    tl.store(out_ptr + offsets, {names[group[-1]]}, mask=mask)")
+    result = emit_pointwise_ops(group, names, lines)
+    lines.append(f"    tl.store(out_ptr + offsets, {result}, mask=mask)")
     return "\n".join(lines) + "\n"
 
 
-def _load_kernel(name, source):
+def new_kernel_name(prefix):
+    global _kernel_counter
+    _kernel_counter += 1
+    return f"{prefix}_{_kernel_counter - 1}"
+
+
+def load_kernel(name, source):
     # triton.jit needs the source to live in a real file (it uses inspect).
     path = os.path.join(KERNEL_DIR, f"{name}.py")
     with open(path, "w") as f:
@@ -146,15 +166,13 @@ def _load_kernel(name, source):
 
 
 def build_fused_op(group, inputs):
-    global _kernel_counter
-    name = f"fused_{_kernel_counter}"
-    _kernel_counter += 1
+    name = new_kernel_name("fused")
 
     out_meta = _tensor_meta(group[-1])
     shape, dtype = tuple(out_meta.shape), out_meta.dtype
     rank = len(shape)
     source = generate_kernel_source(name, group, inputs, rank)
-    kernel = _load_kernel(name, source)
+    kernel = load_kernel(name, source)
 
     # ops = " -> ".join(str(n.target) for n in group)
     # print(f"\n--- {name}: {ops}\n{source}")
@@ -174,13 +192,9 @@ def build_fused_op(group, inputs):
 def fuse_pointwise(gm: fx.GraphModule) -> fx.GraphModule:
     groups = find_fusion_groups(gm.graph)
     for group in groups:
-        members = set(group)
-        inputs = []
-        for node in group:
-            for arg in node.all_input_nodes:
-                if arg not in members:
-                    inputs.append(arg)
-                    
+        if len(group) < 2:  # fusing a single op gains nothing; leave it to ATen
+            continue
+        inputs = external_inputs(group)
         fused_op = build_fused_op(group, inputs)
 
         root = group[-1]

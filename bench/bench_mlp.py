@@ -37,4 +37,4 @@ if __name__ == "__main__":
         
     print(f"eager: {eager_ms:.3f} ms\n"
           f"inductor: {inductor_ms:.3f} ms\n"
-          f"fusion: {fusion_ms:.3f} ms\n")
+          f"fusion: {fusion_ms:.3f} ms")

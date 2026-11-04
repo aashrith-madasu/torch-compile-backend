@@ -13,9 +13,7 @@ class MLPBlock(nn.Module):
         self.scale = nn.Parameter(torch.full((dim,), 0.5))
 
     def forward(self, x):
-        # h = F.gelu(F.gelu(F.gelu(self.fc1(x))))         # gelu decomposes into ~5 pointwise ops
-        h = x
-        for _ in range(10):
-            h = F.gelu(h)
+        h = F.gelu(self.fc1(x))       # gelu decomposes into ~5 pointwise ops
+        y = self.fc2(h)
             
-        return x + torch.tanh(h) * self.scale   # residual + gated scale
+        return x + torch.tanh(y) * self.scale   # residual + gated scale
