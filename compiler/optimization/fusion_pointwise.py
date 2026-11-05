@@ -26,6 +26,7 @@ POINTWISE_OPS = {
     aten.tanh.default: lambda a: f"(2.0 * tl.sigmoid(2.0 * {a}) - 1.0)",
     aten.maximum.default: lambda a, b: f"tl.maximum({a}, {b})",
     aten.minimum.default: lambda a, b: f"tl.minimum({a}, {b})",
+    aten._to_copy.default: lambda a: a,
 }
 
 # Composite ops we break down into the primitives above so they can fuse.
@@ -40,8 +41,28 @@ def _tensor_meta(node):
     return val if isinstance(val, torch.Tensor) else None
 
 
+def _is_float_cast(node: fx.Node) -> bool:
+    """A plain dtype conversion between floats that fit in fp32. A cast below
+    fp32 must end its group: only tl.store actually rounds to the output
+    dtype, so ops after it in the kernel would see the unrounded value."""
+    src, dst = _tensor_meta(node.args[0]), _tensor_meta(node)
+    return (
+        set(node.kwargs) == {"dtype"}
+        and src is not None
+        and dst is not None
+        and src.is_floating_point()
+        and torch.float64 not in (src.dtype, dst.dtype)
+        and (dst.dtype == torch.float32 or not any(_is_fusible(u) for u in node.users))
+    )
+
+
 def _is_fusible(node: fx.Node) -> bool:
-    if node.op != "call_function" or node.target not in POINTWISE_OPS or node.kwargs:
+    if node.op != "call_function" or node.target not in POINTWISE_OPS:
+        return False
+    if node.target == aten._to_copy.default:
+        if not _is_float_cast(node):
+            return False
+    elif node.kwargs:
         return False
     val = _tensor_meta(node)
     return (

@@ -1,40 +1,48 @@
 import torch
 import triton
+import argparse
 
-from models.mlp import MLPBlock
-from compiler import my_backend
+from mlp import MLPBlock
+from compiler.backend import custom_backend
 
+
+precision_to_dtype = {
+    "16": torch.float16,
+    "32": torch.float32,
+    "64": torch.float64
+}
 
 if __name__ == "__main__":
     
-    torch.manual_seed(0)
-    model = MLPBlock().cuda()
-    x = torch.randn(512, 1024, device="cuda")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--precision", type=str)
+    args = parser.parse_args()
+    precision = args.precision
     
-    inductor_compiled = torch.compile(model, backend="inductor")
-    my_compiled = torch.compile(model, backend=my_backend)
+    dtype = precision_to_dtype[precision]
+    eager_model = MLPBlock().to(device="cuda", dtype=dtype)
+    inductor_model = torch.compile(eager_model, backend="inductor")
+    custom_model = torch.compile(eager_model, backend=custom_backend)
     
-    with torch.no_grad():
-        expected = model(x)
-        actual = my_compiled(x)
-    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
-    print("compiled model output matches eager.")
-
-    # # Training: forward and backward graphs both go through the fusion pass.
-    # torch._dynamo.reset()
-    # compiled = torch.compile(model, backend=fusion_backend(verbose=False))
-    # compiled(x).sum().backward()
-    # fused_grad = model.fc1.weight.grad.clone()
-    # model.zero_grad()
-    # model(x).sum().backward()
-    # torch.testing.assert_close(fused_grad, model.fc1.weight.grad, rtol=1e-3, atol=1e-3)
-    # print("Fused gradients match eager.")
+    x = torch.randn(512, 1024).to(device="cuda", dtype=dtype)
+    
 
     with torch.no_grad():
-        eager_ms = triton.testing.do_bench(lambda: model(x))
-        inductor_ms = triton.testing.do_bench(lambda: inductor_compiled(x))
-        fusion_ms = triton.testing.do_bench(lambda: my_compiled(x))
+        torch.testing.assert_close(custom_model(x), eager_model(x), rtol=1e-4, atol=1e-4,
+                                    msg="assert failed: outputs did not match with eager")
+
+    custom_model(x).sum().backward()
+    custom_grad = custom_model.fc1.weight.grad.clone()
+    eager_model.zero_grad()
+    eager_model(x).sum().backward()
+    expected_grad = eager_model.fc1.weight.grad.clone()
+    torch.testing.assert_close(custom_grad, expected_grad, rtol=1e-3, atol=1e-3,
+                                msg="assert failed: gradients did not match with eager")
+
+
+    with torch.no_grad():
+        inductor_ms = triton.testing.do_bench(lambda: inductor_model(x))
+        custom_ms = triton.testing.do_bench(lambda: custom_model(x))
         
-    print(f"eager: {eager_ms:.3f} ms\n"
-          f"inductor: {inductor_ms:.3f} ms\n"
-          f"fusion: {fusion_ms:.3f} ms")
+        print(f"inductor: {inductor_ms:.3f} ms\n"
+              f"custom backend: {custom_ms:.3f} ms")

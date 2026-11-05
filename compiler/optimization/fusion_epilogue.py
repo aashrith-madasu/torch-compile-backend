@@ -1,9 +1,15 @@
+import statistics
+import time
+
 import torch
 import torch.fx as fx
 import triton
+from torch._dispatch.python import no_python_dispatcher
+from torch.utils._python_dispatch import _disable_current_modes
 
 from .fusion_pointwise import (
     _tensor_meta,
+    build_fused_op,
     emit_pointwise_ops,
     external_inputs,
     find_fusion_groups,
@@ -174,10 +180,64 @@ def build_epilogue_op(group, matmul, inputs):
     return epilogue_op
 
 
+def _trial_tensor(val):
+    """A real tensor with the shape, dtype and layout of a node's fake value.
+    Has its own generator so compiling doesn't change the user's random stream."""
+    t = torch.empty_strided(tuple(val.shape), val.stride(), dtype=val.dtype, device=val.device)
+    if not t.is_floating_point():
+        return t.zero_()
+    return t.normal_(generator=torch.Generator(val.device).manual_seed(0))
+
+
+def _median_seconds(fn, warmup=5, reps=20):
+    """Wall-clock time, so Python launch cost counts too. The warmup also
+    triggers the kernel's autotuning and compilation."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    samples = []
+    for _ in range(reps):
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        samples.append(time.perf_counter() - start)
+    return statistics.median(samples)
+
+
+def _epilogue_is_faster(group, matmul, inputs, epilogue_op) -> bool:
+    """Time the fused kernel against what runs without it: the matmul as a
+    plain ATen call (cuBLAS), then the pointwise group on its own. The winner
+    depends on dtype and shape; e.g. fp32 without TF32 favours cuBLAS."""
+    group_inputs = external_inputs(group)
+    mat1, mat2 = matmul.args[-2:]
+
+    # The compiler runs under FakeTensorMode; these need to really execute.
+    with _disable_current_modes(), no_python_dispatcher():
+        nodes = dict.fromkeys(matmul.all_input_nodes + group_inputs)
+        nodes.pop(matmul)
+        env = {n: _trial_tensor(_tensor_meta(n)) for n in nodes}
+        fused_op = build_fused_op(group, group_inputs) if len(group) > 1 else None
+
+        def run_separate():
+            # Mirrors fuse_pointwise, which leaves single ops to ATen.
+            values = dict(env)
+            values[matmul] = matmul.target(*(env[a] for a in matmul.args))
+            if fused_op is not None:
+                return fused_op(*(values[n] for n in group_inputs))
+            node = group[0]
+            args = (values[a] if isinstance(a, fx.Node) else a for a in node.args)
+            return node.target(*args, **node.kwargs)
+
+        fused_args = (env[mat1], env[mat2], *(env[n] for n in inputs))
+        fused_time = _median_seconds(lambda: epilogue_op(*fused_args))
+        separate_time = _median_seconds(run_separate)
+    return fused_time < separate_time
+
+
 def fuse_epilogue(gm: fx.GraphModule) -> fx.GraphModule:
     """Fold each pointwise group that directly consumes a matmul into that
     matmul's epilogue, so the matmul output never goes to memory. Groups
-    that don't qualify are left for fuse_pointwise."""
+    that don't qualify, or run faster unfused, are left for fuse_pointwise."""
     for group in find_fusion_groups(gm.graph):
         group_inputs = external_inputs(group)
         matmul = find_epilogue_anchor(group, group_inputs)
@@ -188,6 +248,8 @@ def fuse_epilogue(gm: fx.GraphModule) -> fx.GraphModule:
         inputs = list(dict.fromkeys(bias + [n for n in group_inputs if n is not matmul]))
         mat1, mat2 = matmul.args[-2:]
         epilogue_op = build_epilogue_op(group, matmul, inputs)
+        if not _epilogue_is_faster(group, matmul, inputs, epilogue_op):
+            continue
 
         root = group[-1]
         with gm.graph.inserting_before(root):
